@@ -6,7 +6,9 @@
 
 ### 这是什么
 
-这是一个**针对 Unicorn / Unidbg 动态执行场景**定制的 Tenet 修改版本。目标是让 Unicorn 产生的 trace 能在 IDA 里用 Tenet 做时间旅行调试，并且在 ARM64 + ASLR + dump 场景下更稳定可用。
+这是一个**针对 Unicorn / Unidbg 动态执行场景**定制的 Tenet 修改版本。目标是让 Unicorn 产生的 trace 能在 IDA 里用 Tenet 做时间旅行调试，并且在 ARM64 + ASLR + dump 场景下更稳定可用。并可以还原所有的相关操作内存（dump 出来的）
+
+tracer 地址为 https://github.com/chenxvb/Unicorn-Trace
 
 ### Fork 关系（含 IDA 9.0 说明）
 
