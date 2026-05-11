@@ -1,6 +1,8 @@
 import bisect
 import struct
 import logging
+import os
+import re
 
 from tenet.types import BreakpointType
 from tenet.util.log import pmsg
@@ -76,6 +78,18 @@ class TraceReader(object):
         # Pass the manual slide to TraceAnalysis, it will use it if not None
         self.analysis = TraceAnalysis(self.trace, dctx, manual_slide=manual_slide)
 
+        # Optional dump overlay memory (for Memory/Stack/Dump views only).
+        # This never writes to IDB/binary; data is consumed only by get_memory().
+        self._dump_overlay_cache = {}
+        self._dump_overlay_timeline = []
+        self._active_dump_overlay = []
+        self._active_dump_timeline_pos = -1
+        self._init_dump_overlay_timeline()
+
+        # When trace carries dump timeline metadata, keep PC in runtime space
+        # for Tenet views/navigation (no ASLR remap). This does not touch IDB bytes.
+        self._use_raw_runtime_ip = bool(self._dump_overlay_timeline)
+
         self._idx_cached_registers = -1
         self._cached_registers = {}
 
@@ -84,6 +98,135 @@ class TraceReader(object):
         #----------------------------------------------------------------------
 
         self._idx_changed_callbacks = []
+
+    def _init_dump_overlay_timeline(self):
+        """
+        Initialize idx -> dump_dir timeline from trace metadata.
+        """
+        timeline = list(getattr(self.trace, "dump_dir_timeline", []) or [])
+        if not timeline:
+            fallback_dump = getattr(self.trace, "dump_dir_from_comment", None)
+            if fallback_dump:
+                timeline = [(0, fallback_dump)]
+
+        if not timeline:
+            return
+
+        # normalize, sort, and squash duplicate idx markers (last wins).
+        timeline.sort(key=lambda x: x[0])
+        normalized = []
+        for idx, dump_dir in timeline:
+            if normalized and normalized[-1][0] == idx:
+                normalized[-1] = (idx, dump_dir)
+            else:
+                normalized.append((idx, dump_dir))
+        self._dump_overlay_timeline = normalized
+        pmsg(f"[Tenet] dump timeline entries: {len(self._dump_overlay_timeline)}")
+
+    def _load_dump_overlay(self, dump_dir):
+        """
+        Load one dump directory as overlay blobs.
+        """
+        if dump_dir in self._dump_overlay_cache:
+            return self._dump_overlay_cache[dump_dir]
+
+        if not os.path.isdir(dump_dir):
+            pmsg(f"[Tenet] dump dir does not exist: {dump_dir}")
+            self._dump_overlay_cache[dump_dir] = []
+            return []
+
+        overlay = []
+        pattern = re.compile(r"0x([0-9a-fA-F]+)_0x([0-9a-fA-F]+)_0x([0-9a-fA-F]+)\.bin$")
+        for name in os.listdir(dump_dir):
+            if not name.endswith(".bin"):
+                continue
+            m = pattern.search(name)
+            if not m:
+                continue
+            base = int(m.group(1), 16)
+            end = int(m.group(2), 16)
+            size = int(m.group(3), 16)
+            if end <= base or size <= 0:
+                continue
+            full = os.path.join(dump_dir, name)
+            try:
+                with open(full, "rb") as f:
+                    data = f.read(size)
+            except Exception as e:
+                pmsg(f"[Tenet] failed to read dump file {full}: {e}")
+                continue
+            if not data:
+                continue
+            overlay.append((base, base + len(data), data))
+
+        overlay.sort(key=lambda x: x[0])
+        self._dump_overlay_cache[dump_dir] = overlay
+        if overlay:
+            pmsg(f"[Tenet] loaded {len(overlay)} dump blobs for memory view from: {dump_dir}")
+        return overlay
+
+    def _select_dump_overlay_for_idx(self, idx):
+        """
+        Select active dump overlay according to current trace idx.
+        """
+        if not self._dump_overlay_timeline:
+            self._active_dump_overlay = []
+            self._active_dump_timeline_pos = -1
+            return
+
+        starts = [x[0] for x in self._dump_overlay_timeline]
+        pos = bisect.bisect_right(starts, idx) - 1
+        if pos < 0:
+            pos = 0
+
+        if pos == self._active_dump_timeline_pos:
+            return
+
+        dump_dir = self._dump_overlay_timeline[pos][1]
+        self._active_dump_overlay = self._load_dump_overlay(dump_dir)
+        self._active_dump_timeline_pos = pos
+
+    def _apply_dump_overlay(self, buffer):
+        """
+        Apply dump overlay to a TraceMemory buffer as baseline bytes.
+        """
+        if not self._active_dump_overlay:
+            return
+
+        buf_start = buffer.address
+        buf_end = buffer.address + buffer.length
+
+        for seg_start, seg_end, data in self._active_dump_overlay:
+            if seg_end <= buf_start:
+                continue
+            if seg_start >= buf_end:
+                break
+
+            overlap_start = max(buf_start, seg_start)
+            overlap_end = min(buf_end, seg_end)
+            if overlap_start >= overlap_end:
+                continue
+
+            src_off = overlap_start - seg_start
+            dst_off = overlap_start - buf_start
+            n = overlap_end - overlap_start
+
+            chunk = data[src_off:src_off+n]
+            for i, b in enumerate(chunk):
+                buffer.data[dst_off + i] = b
+                buffer.mask[dst_off + i] = 0xFF
+
+    def rebase_pointer(self, address):
+        """Map trace/runtime address to disassembler space when enabled."""
+        if self._use_raw_runtime_ip:
+            return address
+        return self.analysis.rebase_pointer(address)
+
+    def unrebase_pointer(self, address):
+        """Map disassembler address back to trace/runtime space when enabled."""
+        if self._use_raw_runtime_ip:
+            return address
+        return self.analysis.unrebase_pointer(address)
 
     #-------------------------------------------------------------------------
     # Trace Properties
@@ -101,7 +244,7 @@ class TraceReader(object):
         """
         Return a rebased version of the current instruction pointer (if available).
         """
-        return self.analysis.rebase_pointer(self.ip)
+        return self.rebase_pointer(self.ip)
 
     @property
     def sp(self):
@@ -301,7 +444,7 @@ class TraceReader(object):
         Step the trace forward over n instructions / calls.
         """
         address = self.get_ip(self.idx)
-        bin_address = self.analysis.rebase_pointer(address)
+        bin_address = self.rebase_pointer(address)
 
         #
         # get the address for the linear instruction address after the
@@ -313,7 +456,7 @@ class TraceReader(object):
             self.seek(self.idx + 1)
             return
 
-        trace_next_address = self.analysis.rebase_pointer(bin_next_address)
+        trace_next_address = self.rebase_pointer(bin_next_address)
 
         #
         # find the next time the instruction after this instruction is
@@ -338,7 +481,7 @@ class TraceReader(object):
         Step the trace backward over n instructions / calls.
         """
         address = self.get_ip(self.idx)
-        bin_address = self.analysis.rebase_pointer(address)
+        bin_address = self.rebase_pointer(address)
 
         bin_prev_address = self.dctx.get_prev_insn(bin_address)
 
@@ -390,7 +533,7 @@ class TraceReader(object):
                 self.seek(self.idx - 1)
                 return
 
-        trace_prev_address = self.analysis.rebase_pointer(bin_prev_address)
+        trace_prev_address = self.rebase_pointer(bin_prev_address)
 
         prev_idx = self.find_prev_execution(trace_prev_address, self.idx)
         if prev_idx == -1:
@@ -776,7 +919,7 @@ class TraceReader(object):
         output = []
         dctx, idx = self.dctx, self.idx
         trace_address = self.get_ip(idx)
-        bin_address = self.analysis.rebase_pointer(trace_address)
+        bin_address = self.rebase_pointer(trace_address)
 
         # (reverse) step over any call instructions
         while len(output) < n and idx > 0:
@@ -811,7 +954,7 @@ class TraceReader(object):
                 #
 
                 if maybe_ret_address == trace_address:
-                    trace_prev_address = self.analysis.rebase_pointer(bin_prev_address)
+                    trace_prev_address = self.rebase_pointer(bin_prev_address)
                     prev_idx = self.find_prev_execution(trace_prev_address, idx)
                     did_step_over = bool(prev_idx != -1)
 
@@ -825,7 +968,7 @@ class TraceReader(object):
             #
 
             if not did_step_over:
-                trace_prev_address = self.analysis.rebase_pointer(bin_prev_address)
+                trace_prev_address = self.rebase_pointer(bin_prev_address)
                 prev_idx = self.find_prev_execution(trace_prev_address, idx)
 
             #
@@ -846,7 +989,7 @@ class TraceReader(object):
             # save the results and continue looping
             output.append(trace_prev_address)
             trace_address = trace_prev_address
-            bin_address = self.analysis.rebase_pointer(trace_address)
+            bin_address = self.rebase_pointer(trace_address)
             idx = prev_idx
 
         # return the list of addresses to be 'executed' next
@@ -869,7 +1012,7 @@ class TraceReader(object):
         output = []
         dctx, idx = self.dctx, self.idx
         trace_address = self.get_ip(idx)
-        bin_address = self.analysis.rebase_pointer(trace_address)
+        bin_address = self.rebase_pointer(trace_address)
 
         # step over any call instructions
         while len(output) < n and idx < (self.trace.length - 1):
@@ -887,7 +1030,7 @@ class TraceReader(object):
             #
 
             if bin_next_address != -1:
-                trace_next_address = self.analysis.rebase_pointer(bin_next_address)
+                trace_next_address = self.rebase_pointer(bin_next_address)
                 next_idx = self.find_next_execution(trace_next_address, idx)
             else:
                 next_idx = -1
@@ -913,7 +1056,7 @@ class TraceReader(object):
 
             # save the results and continue looping
             output.append(trace_next_address)
-            bin_address = self.analysis.rebase_pointer(trace_next_address)
+            bin_address = self.rebase_pointer(trace_next_address)
             idx = next_idx
 
         # return the list of addresses to be 'executed' next
@@ -1474,7 +1617,7 @@ class TraceReader(object):
 
         # Get the function containing the instruction at the starting index
         start_ip = self.trace.get_ip(start_idx) # Use internal for performance
-        start_rebased_ip = self.analysis.rebase_pointer(start_ip)
+        start_rebased_ip = self.rebase_pointer(start_ip)
         try:
             start_func = self.dctx.get_func(start_rebased_ip)
         except Exception as e:
@@ -1496,7 +1639,7 @@ class TraceReader(object):
         # Iterate forward through the trace
         while idx < self.trace.length:
             current_ip = self.trace.get_ip(idx)
-            rebased_ip = self.analysis.rebase_pointer(current_ip)
+            rebased_ip = self.rebase_pointer(current_ip)
 
             # Check if the instruction is within the original function's bounds
             # This simple check might be insufficient for complex control flow (e.g. tail calls outside bounds)
@@ -1828,6 +1971,8 @@ class TraceReader(object):
 
         #print(f"STARTING MEM FETCH AT IDX {idx} (reader @ {self.idx})")
         buffer = TraceMemory(address, length)
+        self._select_dump_overlay_for_idx(idx)
+        self._apply_dump_overlay(buffer)
 
         #
         # translate the (address, len) 'region' definition to a set of pointer

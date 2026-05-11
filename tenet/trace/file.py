@@ -225,6 +225,8 @@ class TraceFile(object):
         self.arch = arch
         self.runtime_base_from_comment = None # Added
         self.parsed_comment_line = False # Added: Flag to indicate if the first line was parsed as comment
+        self.dump_dir_from_comment = None
+        self.dump_dir_timeline = []
 
         #
         # TODO: really, the trace file should auto-detect arch imo but i'll
@@ -484,6 +486,11 @@ class TraceFile(object):
         #
 
         if zipfile.is_zipfile(self.packed_filepath):
+            # If trace text contains DUMP_DIR markers, force text parse so we can
+            # build dump timeline (not serialized into .tt currently).
+            if self._text_trace_has_dump_markers(self.filepath):
+                self._load_text_trace(self.filepath)
+                return
             packed_crc = self._fetch_hash(self.packed_filepath)
             text_crc = hash_file(self.filepath)
 
@@ -502,6 +509,34 @@ class TraceFile(object):
         #
 
         self._load_text_trace(self.filepath)
+
+    def _text_trace_has_dump_markers(self, filepath):
+        """Fast check for DUMP_DIR markers in raw trace text."""
+        try:
+            with open(filepath, "r") as f:
+                for _ in range(256):
+                    line = f.readline()
+                    if not line:
+                        break
+                    if line.startswith("# DUMP_DIR:"):
+                        return True
+        except Exception:
+            return False
+        return False
+
+    def register_dump_dir_marker(self, idx, dump_dir):
+        """Register dump directory effective from trace idx."""
+        if not dump_dir:
+            return
+        dump_dir = dump_dir.strip()
+        if not dump_dir:
+            return
+
+        # compatibility field for older code paths
+        if self.dump_dir_from_comment is None:
+            self.dump_dir_from_comment = dump_dir
+
+        self.dump_dir_timeline.append((int(idx), dump_dir))
 
     def _load_packed_trace(self, filepath):
         """
@@ -662,22 +697,39 @@ class TraceFile(object):
         if not hasattr(self, 'parsed_comment_line') or not self.parsed_comment_line:
             self.parsed_comment_line = False
 
-        # Try to parse the first line for base address
+        # Try to parse metadata comments at the top of trace file.
+        # Supported:
+        #   # SO: <name> @ 0x...
+        #   # DUMP_DIR: /path/to/dump_xxx
         try:
             with open(filepath, 'r') as f_check:
-                first_line = f_check.readline()
-                if first_line: # Check if file is not empty
-                    match = re.match(r"# SO: .* @ (0x[0-9a-fA-F]+)", first_line.strip())
-                    if match:
-                        self.runtime_base_from_comment = int(match.group(1), 16)
+                saw_any = False
+                for raw_line in f_check:
+                    saw_any = True
+                    line = raw_line.strip()
+                    if not line:
+                        continue
+                    if not line.startswith("#"):
+                        break
+
+                    so_match = re.match(r"# SO: .* @ (0x[0-9a-fA-F]+)", line)
+                    if so_match:
+                        self.runtime_base_from_comment = int(so_match.group(1), 16)
                         self.parsed_comment_line = True
                         pmsg(f"Parsed runtime base 0x{self.runtime_base_from_comment:X} from trace file comment.")
-                    else:
-                        pmsg("First line is not a recognized base address comment.")
-                else:
+                        continue
+
+                    dump_match = re.match(r"# DUMP_DIR:\s*(.+)$", line)
+                    if dump_match:
+                        parsed_dump_dir = dump_match.group(1).strip()
+                        self.register_dump_dir_marker(0, parsed_dump_dir)
+                        pmsg(f"Parsed dump dir from trace file comment: {parsed_dump_dir}")
+                        continue
+
+                if not saw_any:
                     pmsg("Trace file is empty.")
         except Exception as e:
-            pmsg(f"Could not read or parse first line for base address: {e}")
+            pmsg(f"Could not read or parse trace metadata comments: {e}")
 
         # load / parse a text trace into trace segments
         with open(filepath, 'r') as f:
@@ -1597,6 +1649,17 @@ class TraceSegment(object):
         """
         Process one line of text from a delta reg/mem trace.
         """
+        line = line.strip()
+        if not line:
+            return False
+        if line.startswith("#"):
+            dump_match = re.match(r"# DUMP_DIR:\s*(.+)$", line)
+            if dump_match:
+                dump_dir = dump_match.group(1).strip()
+                global_idx = self.base_idx + relative_idx
+                self.trace.register_dump_dir_marker(global_idx, dump_dir)
+            return False
+
         IP = self.trace.arch.IP
         REGISTERS = self.trace.arch.REGISTERS
         
@@ -1605,6 +1668,10 @@ class TraceSegment(object):
 
         # split the state info (registers, memory) into individual items to process
         for item in delta:
+            item = item.strip()
+            if not item:
+                # tolerate trailing commas / empty tokens silently
+                continue
             # Split only on the first '=', handle potential malformed entries
             parts = item.split("=", 1)
             if len(parts) != 2:

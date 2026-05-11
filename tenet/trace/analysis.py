@@ -124,6 +124,9 @@ class TraceAnalysis(object):
         Analyze trace execution to resolve ASLR mappings against the disassembler.
         """
         dctx, trace = self._dctx, self._trace
+        if dctx is None:
+            self.slide = None
+            return False
 
         # If a manual slide was provided, use it directly
         if manual_slide is not None:
@@ -149,6 +152,10 @@ class TraceAnalysis(object):
         # --- Original Automatic Detection Logic Starts Here ---
         # get *all* of the instruction addresses from disassembler
         instruction_addresses = dctx.get_instruction_addresses()
+        if not instruction_addresses:
+            pmsg("[Tenet] No instruction addresses in current IDA database, skipping ASLR analysis.")
+            self.slide = None
+            return False
 
         #
         # bucket the instruction addresses from the disassembler
@@ -242,7 +249,7 @@ class TraceAnalysis(object):
             # in which case we will have to perform more aggressive analysis
             #
 
-            if (hit / seen) > 0.95:
+            if seen and (hit / seen) > 0.95:
                 #print(f"ASLR Slide: {k:08X} Quality: {hit/seen:0.2f} (h {hit} s {seen} e {expected})")
                 slide = k
                 break

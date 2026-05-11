@@ -63,6 +63,7 @@ class TraceBar(QtWidgets.QWidget):
         self._idx_reads = []
         self._idx_writes = []
         self._idx_executions = []
+        self._idx_dump_loads = []
 
         # the magnetism distance (in pixels) for cursor clicks on viz events
         self._magnetism_distance = 4
@@ -221,6 +222,7 @@ class TraceBar(QtWidgets.QWidget):
         self._last_trace_idx = min(self.reader.trace.length, self.end_idx)
 
         # refresh/redraw relevant elements
+        self._refresh_dump_markers()
         self._refresh_trace_highlights()
         self.refresh()
 
@@ -256,6 +258,7 @@ class TraceBar(QtWidgets.QWidget):
         self._idx_reads = []
         self._idx_writes = []
         self._idx_executions = []
+        self._idx_dump_loads = []
 
         self._refresh_painting_metrics()
         self.refresh()
@@ -724,8 +727,25 @@ class TraceBar(QtWidgets.QWidget):
         """
         The focused breakpoint has changed.
         """
+        self._refresh_dump_markers()
         self._refresh_trace_highlights()
         self.refresh()
+
+    def _refresh_dump_markers(self):
+        """
+        Refresh load-dump marker idxs from reader timeline within current bounds.
+        """
+        self._idx_dump_loads = []
+        if not self.reader:
+            return
+
+        timeline = getattr(self.reader, "_dump_overlay_timeline", []) or []
+        if not timeline:
+            return
+
+        for idx, _dump_dir in timeline:
+            if self.start_idx <= idx < self.end_idx:
+                self._idx_dump_loads.append(idx)
 
     def _refresh_trace_highlights(self):
         """
@@ -883,7 +903,7 @@ class TraceBar(QtWidgets.QWidget):
 
             # get the executed/code address for the current idx that will represent this line
             address = self.reader.get_ip(idx)
-            rebased_address = self.reader.analysis.rebase_pointer(address)
+            rebased_address = self.reader.rebase_pointer(address)
 
             # select the color for instructions that can be viewed with Tenet
             if dctx.is_mapped(rebased_address):
@@ -942,7 +962,7 @@ class TraceBar(QtWidgets.QWidget):
 
             # get the executed/code address for the current idx that will represent this cell
             address = self.reader.get_ip(idx)
-            rebased_address = self.reader.analysis.rebase_pointer(address)
+            rebased_address = self.reader.rebase_pointer(address)
 
             # select the color for instructions that can be viewed with Tenet
             if dctx.is_mapped(rebased_address):
@@ -1010,6 +1030,14 @@ class TraceBar(QtWidgets.QWidget):
                 # draw cell body
                 painter.drawRect(int(viz_x), int(y), int(viz_w), int(h))
 
+        # draw dump-load markers on timeline
+        painter.setPen(QtGui.QPen(QtGui.QColor(255, 191, 0), 1, QtCore.Qt.SolidLine))
+        for idx in self._idx_dump_loads:
+            if not(self.start_idx <= idx < self.end_idx):
+                continue
+            y = self._idx2pos(idx) + self._cell_border
+            painter.drawLine(int(viz_x), int(y), int(viz_w), int(y))
+
     def _draw_highlights_trace(self, painter):
         """
         Draw trace-based event highlights.
@@ -1035,6 +1063,14 @@ class TraceBar(QtWidgets.QWidget):
 
                 y = self._idx2pos(idx)
                 painter.drawLine(viz_x, y, viz_w, y)
+
+        # draw dump-load markers on timeline
+        painter.setPen(QtGui.QPen(QtGui.QColor(255, 191, 0), 1, QtCore.Qt.SolidLine))
+        for idx in self._idx_dump_loads:
+            if not(self.start_idx <= idx < self.end_idx):
+                continue
+            y = self._idx2pos(idx)
+            painter.drawLine(viz_x, y, viz_w, y)
 
     def _draw_cursor(self):
         """

@@ -313,7 +313,7 @@ class TenetContext(object):
         Handle UI actions for seeking to the next execution of the selected address.
         """
         address = disassembler[self].get_current_address()
-        rebased_address = self.reader.analysis.rebase_pointer(address)
+        rebased_address = self.reader.rebase_pointer(address)
         result = self.reader.seek_to_next(rebased_address, BreakpointType.EXEC)
 
         # TODO: blink screen? make failure more visible...
@@ -325,7 +325,7 @@ class TenetContext(object):
         Handle UI actions for seeking to the previous execution of the selected address.
         """
         address = disassembler[self].get_current_address()
-        rebased_address = self.reader.analysis.rebase_pointer(address)
+        rebased_address = self.reader.rebase_pointer(address)
         result = self.reader.seek_to_prev(rebased_address, BreakpointType.EXEC)
 
         # TODO: blink screen? make failure more visible...
@@ -337,7 +337,7 @@ class TenetContext(object):
         Handle UI actions for seeking to the first execution of the selected address.
         """
         address = disassembler[self].get_current_address()
-        rebased_address = self.reader.analysis.rebase_pointer(address)
+        rebased_address = self.reader.rebase_pointer(address)
         result = self.reader.seek_to_first(rebased_address, BreakpointType.EXEC)
 
         # TODO: blink screen? make failure more visible...
@@ -349,7 +349,7 @@ class TenetContext(object):
         Handle UI actions for seeking to the final execution of the selected address.
         """
         address = disassembler[self].get_current_address()
-        rebased_address = self.reader.analysis.rebase_pointer(address)
+        rebased_address = self.reader.rebase_pointer(address)
         result = self.reader.seek_to_final(rebased_address, BreakpointType.EXEC)
 
         # TODO: blink screen? make failure more visible...
@@ -359,37 +359,17 @@ class TenetContext(object):
     def _idx_changed(self, idx):
         """
         Handle a trace reader event indicating that the current IDX has changed.
-
-        This will make the disassembler track with the PC/IP of the trace reader. 
         """
         dctx = disassembler[self]
-
-        #
-        # get a 'rebased' version of the current instruction pointer, which
-        # should map to the disassembler / open database if it is a code
-        # address that is known
-        #
-
         bin_address = self.reader.rebased_ip
-
-        #
-        # if the code address is in a library / other unknown area that
-        # cannot be renedered by the disassembler, then resolve the last
-        # known trace 'address' within the database
-        #
 
         if not dctx.is_mapped(bin_address):
             last_good_idx = self.reader.analysis.get_prev_mapped_idx(idx)
             if last_good_idx == -1:
-                return # navigation is just not gonna happen...
-
-            # fetch the last instruction pointer to fall within the trace
+                return
             last_good_trace_address = self.reader.get_ip(last_good_idx)
+            bin_address = self.reader.rebase_pointer(last_good_trace_address)
 
-            # convert the trace-based instruction pointer to one that maps to the disassembler
-            bin_address = self.reader.analysis.rebase_pointer(last_good_trace_address)
-
-        # navigate the disassembler to a 'suitable' address based on the trace idx
         dctx.navigate(bin_address)
         disassembler.refresh_views()
 
