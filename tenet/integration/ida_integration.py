@@ -6,9 +6,15 @@ import logging
 #
 
 import ida_dbg
+import ida_bytes
 import ida_idaapi
 import ida_kernwin
-import idautils
+import idautils # Add import for idautils
+import ida_lines
+try:
+    import ida_hexrays
+except ImportError:
+    ida_hexrays = None
 
 from tenet.core import TenetCore
 from tenet.types import BreakpointEvent
@@ -44,13 +50,13 @@ class TenetIDA(TenetCore):
         #
 
         self._hooked = False
-
+        
         self._ui_hooks = UIHooks()
-        self._ui_hooks._render_lines_cb = self._render_lines
-        self._ui_hooks._popup_cb = self._popup_hook
+        self._ui_hooks.get_lines_rendering_info = self._render_lines
+        self._ui_hooks.finish_populating_widget_popup = self._popup_hook
 
         self._dbg_hooks = DbgHooks()
-        self._dbg_hooks._bpt_changed_cb = self._breakpoint_changed_hook
+        self._dbg_hooks.dbg_bpt_changed = self._breakpoint_changed_hook
 
         #
         # we should always hook the UI early in dev mode as we will use UI
@@ -573,7 +579,11 @@ class TenetIDA(TenetCore):
         view_type = ida_kernwin.get_widget_type(widget)
 
         # only attach these context items to popups in disas views
-        if view_type == ida_kernwin.BWN_DISASMS:
+        disasm_view_types = {
+            getattr(ida_kernwin, "BWN_DISASM", None),
+            getattr(ida_kernwin, "BWN_DISASMS", None),
+        }
+        if view_type in disasm_view_types:
 
             # prep for some shady hacks
             p_qmenu = ctypes.cast(int(popup), ctypes.POINTER(ctypes.c_void_p))[0]
@@ -642,7 +652,216 @@ class TenetIDA(TenetCore):
                     break
 
     def _render_lines(self, lines_out, widget, lines_in):
-        pass
+        """
+        (Event) IDA is about to render code viewer lines.
+        """
+        widget_type = ida_kernwin.get_widget_type(widget)
+        # --- DEBUG LOGGING START ---
+        hexrays_status = "Available" if ida_hexrays else "Not Available"
+        logger.debug(f"_render_lines called for widget_type: {widget_type}, ida_hexrays: {hexrays_status}")
+        # --- DEBUG LOGGING END ---
+
+        ctx = self.get_context(IDA_GLOBAL_CTX, startup=False)
+        if not ctx or not ctx.reader:
+            # logger.debug("_render_lines: No active context or reader, returning.") # Keep logs focused
+            return
+
+        # Compute the colors needed for highlighting
+        address_to_color = self._compute_highlight_colors(ctx)
+        if not address_to_color:
+            # logger.debug("_render_lines: No colors to highlight, returning.") # Keep logs focused
+            return
+        # logger.debug(f"_render_lines: Computed colors: { {hex(k): v for k,v in address_to_color.items()} }") # DEBUG: Very verbose
+
+        # Apply highlighting based on the view type
+        if widget_type == ida_kernwin.BWN_DISASM:
+            # logger.debug("_render_lines: Highlighting disassembly.")
+            self._highlight_disassembly(lines_out, lines_in, address_to_color)
+        elif ida_hexrays and widget_type == ida_kernwin.BWN_PSEUDOCODE:
+            logger.debug("_render_lines: Highlighting pseudocode.")
+            self._highlight_pseudocode(lines_out, widget, lines_in, address_to_color)
+        else:
+            # logger.debug(f"_render_lines: Ignoring widget type {widget_type}.") # DEBUG: Can be noisy
+            pass
+
+        return
+
+    def _compute_highlight_colors(self, ctx):
+        """
+        Compute the address-to-color mapping for the current trace state.
+        Returns a dictionary {address: color} or None if no reader.
+        """
+        if not ctx or not ctx.reader:
+            return None
+
+        trail_length = 6
+        address_to_color = {}
+
+        # Colors from palette
+        forward_color = self.palette.trail_forward
+        current_color_qt = self.palette.trail_current
+        backward_color = self.palette.trail_backward
+
+        # Convert current color to IDA format (0xAABBGGRR)
+        r, g, b, _ = current_color_qt.getRgb()
+        current_color_ida = 0xFF << 24 | b << 16 | g << 8 | r
+
+        # Determine step over state
+        step_over = False
+        modifiers = QtGui.QGuiApplication.keyboardModifiers()
+        step_over = bool(modifiers & QtCore.Qt.ShiftModifier)
+
+        # Get IPs for trails
+        forward_ips = ctx.reader.get_next_ips(trail_length, step_over)
+        backward_ips = ctx.reader.get_prev_ips(trail_length, step_over)
+
+        # Process trails
+        trails_data = [
+            (backward_ips, backward_color),
+            (forward_ips, forward_color)
+        ]
+
+        for addresses, base_color in trails_data:
+            for i, address in enumerate(addresses):
+                percent = 1.0 - ((trail_length - i) / trail_length)
+                r, g, b, _ = base_color.getRgb()
+                ida_color = b << 16 | g << 8 | r
+                ida_color |= (0xFF - int(0xFF * percent)) << 24 # Apply alpha fade
+
+                rebased_address = ctx.reader.analysis.rebase_pointer(address)
+                if rebased_address != ida_idaapi.BADADDR:
+                    address_to_color[rebased_address] = ida_color
+
+        # Handle current address
+        current_address_rebased = ctx.reader.rebased_ip
+        if not ida_bytes.is_mapped(current_address_rebased):
+            last_good_idx = ctx.reader.analysis.get_prev_mapped_idx(ctx.reader.idx)
+            if last_good_idx != -1:
+                last_good_trace_address = ctx.reader.get_ip(last_good_idx)
+                current_address_rebased = ctx.reader.analysis.rebase_pointer(last_good_trace_address)
+
+        if current_address_rebased != ida_idaapi.BADADDR:
+            address_to_color[current_address_rebased] = current_color_ida # Override trail color if current
+
+        return address_to_color
+
+    def _highlight_disassembly(self, lines_out, lines_in, address_to_color):
+        """
+        Apply highlighting to IDA Disassembly view lines.
+        """
+        # Iterate through the lines provided by IDA
+        for section in lines_in.sections_lines:
+            for line in section:
+                # Get the address associated with the line
+                address = line.at.toea()
+
+                # Check if this address needs highlighting
+                color = address_to_color.get(address)
+                if color is not None:
+                    # Create and add the rendering entry
+                    try:
+                        entry = ida_kernwin.line_rendering_output_entry_t(
+                            line,
+                            ida_kernwin.LROEF_FULL_LINE,
+                            color
+                        )
+                        lines_out.entries.push_back(entry)
+                    except Exception as e:
+                        logger.error(f"Error creating/adding disassembly entry for ea {address:#x}: {e}")
+
+    def _highlight_pseudocode(self, lines_out, widget, lines_in, address_to_color):
+        """
+        Apply highlighting to IDA Pseudocode view lines.
+        """
+        logger.debug("_highlight_pseudocode: Entered.")
+        if not ida_hexrays:
+            logger.debug("_highlight_pseudocode: Hex-Rays not available.")
+            return
+
+        try:
+            # Get vdui and cfunc objects
+            vdui = ida_hexrays.get_widget_vdui(widget)
+            if not vdui:
+                logger.debug("_highlight_pseudocode: Failed to get vdui.")
+                return
+            cfunc = vdui.cfunc
+            if not cfunc:
+                logger.debug("_highlight_pseudocode: Failed to get cfunc.")
+                return
+            logger.debug(f"_highlight_pseudocode: Got vdui and cfunc for func @ {cfunc.entry_ea:#x}")
+
+            # Pre-create citem_t objects for reuse
+            head = ida_hexrays.ctree_item_t()
+            item = ida_hexrays.ctree_item_t()
+            tail = ida_hexrays.ctree_item_t()
+
+            # Iterate through the lines provided by IDA
+            for section in lines_in.sections_lines:
+                for tw_line in section:
+                    if tw_line is None: continue
+
+                    place = tw_line.at
+                    if place is None: continue
+
+                    ea = ida_idaapi.BADADDR
+                    line_text_raw = tw_line.line # Get SWIG proxy directly
+
+                    # Avoid processing if line is empty or None
+                    if not line_text_raw: continue
+
+                    # Attempt to get the address associated with the line item
+                    try:
+                        # No need to manually clean tags for get_line_item based on typical usage
+                        # clean_line_text = ida_lines.tag_remove(line_text_raw.c_str()) # Potential optimization: avoid if not needed
+                        # if not clean_line_text: continue
+
+                        lnnum = place.lnnum
+                        is_ctree_line = lnnum >= cfunc.hdrlines
+
+                        # Use raw line text (SWIG proxy) directly with get_line_item
+                        found = cfunc.get_line_item(line_text_raw, 0, is_ctree_line, head, item, tail)
+
+                        if found:
+                            # Check item first, ensuring 'ea' attribute exists and is valid
+                            if item.citype != ida_hexrays.VDI_NONE and hasattr(item, 'ea') and item.ea != ida_idaapi.BADADDR:
+                                ea = item.ea
+                            # If item didn't yield a valid ea, check head
+                            elif head.citype != ida_hexrays.VDI_NONE and hasattr(head, 'ea') and head.ea != ida_idaapi.BADADDR:
+                                ea = head.ea
+                            # Add tail check if necessary, with hasattr check:
+                            # elif tail.citype != ida_hexrays.VDI_NONE and hasattr(tail, 'ea') and tail.ea != ida_idaapi.BADADDR:
+                            #     ea = tail.ea
+
+                    except Exception as e:
+                        # Log error but continue processing other lines
+                        logger.warning(f"Error getting citem for pseudocode line {lnnum}: {e}")
+                        continue # Skip to next line on error
+
+                    # If we couldn't map the line to a valid address, skip it
+                    if ea == ida_idaapi.BADADDR:
+                        continue
+
+                    # Check if this address needs highlighting
+                    color = address_to_color.get(ea)
+                    if color is not None:
+                        logger.debug(f"_highlight_pseudocode: Found color {color:#x} for ea {ea:#x} on line {lnnum}")
+                        # Create and add the rendering entry
+                        try:
+                            entry = ida_kernwin.line_rendering_output_entry_t(
+                                tw_line,
+                                ida_kernwin.LROEF_FULL_LINE,
+                                color
+                            )
+                            lines_out.entries.push_back(entry)
+                            logger.debug(f"_highlight_pseudocode: Added entry for line {lnnum}, ea {ea:#x}")
+                            # NOTE: Potential lifecycle management needed for 'entry' if issues arise
+                        except Exception as e:
+                            logger.error(f"Error creating/adding pseudocode entry for ea {ea:#x}: {e}")
+                    # else: # DEBUG: Log if no color found for a valid ea
+                    #     logger.debug(f"_highlight_pseudocode: No color found for ea {ea:#x} on line {lnnum}")
+
+        except Exception as e:
+            logger.error(f"Error in _highlight_pseudocode: {e}", exc_info=True) # Add traceback
 
     #----------------------------------------------------------------------
     # Callbacks
@@ -881,30 +1100,13 @@ class IDACtxEntry(ida_kernwin.action_handler_t):
 #------------------------------------------------------------------------------
 
 class DbgHooks(ida_dbg.DBG_Hooks):
-    def __init__(self):
-        super(DbgHooks, self).__init__()
-        self._bpt_changed_cb = None
-
     def dbg_bpt_changed(self, code, bpt):
-        if self._bpt_changed_cb:
-            return self._bpt_changed_cb(code, bpt)
-        return 0
+        pass
 
 class UIHooks(ida_kernwin.UI_Hooks):
-    def __init__(self):
-        super(UIHooks, self).__init__()
-        self._render_lines_cb = None
-        self._popup_cb = None
-        self._ready_to_run_cb = None
-
     def get_lines_rendering_info(self, lines_out, widget, lines_in):
-        if self._render_lines_cb:
-            self._render_lines_cb(lines_out, widget, lines_in)
-
+        pass
     def ready_to_run(self):
-        if self._ready_to_run_cb:
-            self._ready_to_run_cb()
-
+        pass
     def finish_populating_widget_popup(self, widget, popup):
-        if self._popup_cb:
-            self._popup_cb(widget, popup)
+        pass
