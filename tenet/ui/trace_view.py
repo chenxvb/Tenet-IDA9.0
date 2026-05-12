@@ -1007,7 +1007,7 @@ class TraceBar(QtWidgets.QWidget):
         [
             (self._idx_reads, self.pctx.palette.mem_read_bg),
             (self._idx_writes, self.pctx.palette.mem_write_bg),
-            (self._idx_executions, self.pctx.palette.breakpoint),
+            (self._idx_executions, QtGui.QColor(255, 64, 64)),
         ]
 
         painter.setPen(QtCore.Qt.NoPen)
@@ -1049,7 +1049,7 @@ class TraceBar(QtWidgets.QWidget):
         [
             (self._idx_reads, self.pctx.palette.mem_read_bg),
             (self._idx_writes, self.pctx.palette.mem_write_bg),
-            (self._idx_executions, self.pctx.palette.breakpoint),
+            (self._idx_executions, QtGui.QColor(255, 64, 64)),
         ]
 
         for entries, color in access_sets:
