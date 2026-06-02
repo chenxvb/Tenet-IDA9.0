@@ -50,13 +50,13 @@ class TenetIDA(TenetCore):
         #
 
         self._hooked = False
-        
+
         self._ui_hooks = UIHooks()
-        self._ui_hooks.get_lines_rendering_info = self._render_lines
-        self._ui_hooks.finish_populating_widget_popup = self._popup_hook
+        self._ui_hooks._render_lines_cb = self._render_lines
+        self._ui_hooks._popup_cb = self._popup_hook
 
         self._dbg_hooks = DbgHooks()
-        self._dbg_hooks.dbg_bpt_changed = self._breakpoint_changed_hook
+        self._dbg_hooks._bpt_changed_cb = self._breakpoint_changed_hook
 
         #
         # we should always hook the UI early in dev mode as we will use UI
@@ -724,7 +724,7 @@ class TenetIDA(TenetCore):
                 ida_color = b << 16 | g << 8 | r
                 ida_color |= (0xFF - int(0xFF * percent)) << 24 # Apply alpha fade
 
-                rebased_address = ctx.reader.analysis.rebase_pointer(address)
+                rebased_address = ctx.reader.rebase_pointer(address)
                 if rebased_address != ida_idaapi.BADADDR:
                     address_to_color[rebased_address] = ida_color
 
@@ -734,7 +734,7 @@ class TenetIDA(TenetCore):
             last_good_idx = ctx.reader.analysis.get_prev_mapped_idx(ctx.reader.idx)
             if last_good_idx != -1:
                 last_good_trace_address = ctx.reader.get_ip(last_good_idx)
-                current_address_rebased = ctx.reader.analysis.rebase_pointer(last_good_trace_address)
+                current_address_rebased = ctx.reader.rebase_pointer(last_good_trace_address)
 
         if current_address_rebased != ida_idaapi.BADADDR:
             address_to_color[current_address_rebased] = current_color_ida # Override trail color if current
@@ -1096,13 +1096,39 @@ class IDACtxEntry(ida_kernwin.action_handler_t):
 #------------------------------------------------------------------------------
 
 class DbgHooks(ida_dbg.DBG_Hooks):
+    def __init__(self):
+        super(DbgHooks, self).__init__()
+        self._bpt_changed_cb = None
+
     def dbg_bpt_changed(self, code, bpt):
-        pass
+        if self._bpt_changed_cb:
+            return self._bpt_changed_cb(code, bpt)
+        return 0
 
 class UIHooks(ida_kernwin.UI_Hooks):
+    def __init__(self):
+        super(UIHooks, self).__init__()
+        self._render_lines_cb = None
+        self._popup_cb = None
+        self._ready_to_run_cb = None
+
     def get_lines_rendering_info(self, lines_out, widget, lines_in):
-        pass
+        if self._render_lines_cb:
+            try:
+                self._render_lines_cb(lines_out, widget, lines_in)
+            except Exception:
+                logger.exception("Error in get_lines_rendering_info callback")
+
     def ready_to_run(self):
-        pass
+        if self._ready_to_run_cb:
+            try:
+                self._ready_to_run_cb()
+            except Exception:
+                logger.exception("Error in ready_to_run callback")
+
     def finish_populating_widget_popup(self, widget, popup):
-        pass
+        if self._popup_cb:
+            try:
+                self._popup_cb(widget, popup)
+            except Exception:
+                logger.exception("Error in finish_populating_widget_popup callback")
