@@ -52,11 +52,11 @@ class TenetIDA(TenetCore):
         self._hooked = False
         
         self._ui_hooks = UIHooks()
-        self._ui_hooks._render_lines_cb = self._render_lines
-        self._ui_hooks._popup_cb = self._popup_hook
+        self._ui_hooks.get_lines_rendering_info = self._render_lines
+        self._ui_hooks.finish_populating_widget_popup = self._popup_hook
 
         self._dbg_hooks = DbgHooks()
-        self._dbg_hooks._bpt_changed_cb = self._breakpoint_changed_hook
+        self._dbg_hooks.dbg_bpt_changed = self._breakpoint_changed_hook
 
         #
         # we should always hook the UI early in dev mode as we will use UI
@@ -579,33 +579,73 @@ class TenetIDA(TenetCore):
         view_type = ida_kernwin.get_widget_type(widget)
 
         # only attach these context items to popups in disas views
-        disasm_view_types = {
-            getattr(ida_kernwin, "BWN_DISASM", None),
-            getattr(ida_kernwin, "BWN_DISASMS", None),
-        }
-        if view_type not in disasm_view_types:
-            return
+        if view_type == ida_kernwin.BWN_DISASMS:
 
-        def attach_with_fallback(action_name, preferred_path=None):
-            try:
-                if preferred_path:
-                    ok = ida_kernwin.attach_action_to_popup(
-                        widget, popup, action_name, preferred_path, ida_kernwin.SETMENU_APP
-                    )
-                    if ok:
-                        return True
-                return ida_kernwin.attach_action_to_popup(
-                    widget, popup, action_name, None, ida_kernwin.SETMENU_APP
-                )
-            except Exception:
-                logger.exception("Failed attaching popup action: %s", action_name)
-                return False
+            # prep for some shady hacks
+            p_qmenu = ctypes.cast(int(popup), ctypes.POINTER(ctypes.c_void_p))[0]
+            qmenu = sip.wrapinstance(int(p_qmenu), QtWidgets.QMenu)
 
-        # Keep popup registration simple/stable across IDA/PySide variants.
-        attach_with_fallback(self.ACTION_NEXT_EXECUTION, "Rename")
-        attach_with_fallback(self.ACTION_PREV_EXECUTION, "Rename")
-        attach_with_fallback(self.ACTION_FIRST_EXECUTION, None)
-        attach_with_fallback(self.ACTION_FINAL_EXECUTION, None)
+            #
+            # inject and organize the Tenet plugin actions
+            #
+
+            ida_kernwin.attach_action_to_popup(
+                widget,
+                popup,
+                self.ACTION_NEXT_EXECUTION,  # The action ID (see above)
+                "Rename",                    # Relative path of where to add the action
+                ida_kernwin.SETMENU_APP      # We want to append the action after ^
+            )
+
+            #
+            # this is part of our bodge to inject a plugin action submenu
+            # at a specific location in the QMenu, cuz I don't think it's
+            # actually possible with the native IDA API's (for groups...)
+            #
+
+            for action in qmenu.actions():
+                if action.text() == "Go to next execution":
+
+                    # inject a group for the exta 'go to' actions
+                    goto_submenu = QtWidgets.QMenu("Go to...")
+                    qmenu.insertMenu(action, goto_submenu)
+
+                    # hold a Qt ref of the submenu so it doesn't GC
+                    self.__goto_submenu = goto_submenu
+                    break
+
+            ida_kernwin.attach_action_to_popup(
+                widget,
+                popup,
+                self.ACTION_FIRST_EXECUTION,     # The action ID (see above)
+                "Go to.../",                     # Relative path of where to add the action
+                ida_kernwin.SETMENU_APP          # We want to append the action after ^
+            )
+
+            ida_kernwin.attach_action_to_popup(
+                widget,
+                popup,
+                self.ACTION_FINAL_EXECUTION,     # The action ID (see above)
+                "Go to.../",                     # Relative path of where to add the action
+                ida_kernwin.SETMENU_APP          # We want to append the action after ^
+            )
+
+            ida_kernwin.attach_action_to_popup(
+                widget,
+                popup,
+                self.ACTION_PREV_EXECUTION,  # The action ID (see above)
+                "Rename",                    # Relative path of where to add the action
+                ida_kernwin.SETMENU_APP      # We want to append the action after ^
+            )
+
+            #
+            # inject a seperator to help insulate our plugin action group
+            #
+
+            for action in qmenu.actions():
+                if action.text() == "Go to previous execution":
+                    qmenu.insertSeparator(action)
+                    break
 
     def _render_lines(self, lines_out, widget, lines_in):
         """
@@ -630,11 +670,7 @@ class TenetIDA(TenetCore):
         # logger.debug(f"_render_lines: Computed colors: { {hex(k): v for k,v in address_to_color.items()} }") # DEBUG: Very verbose
 
         # Apply highlighting based on the view type
-        disasm_view_types = {
-            getattr(ida_kernwin, "BWN_DISASM", None),
-            getattr(ida_kernwin, "BWN_DISASMS", None),
-        }
-        if widget_type in disasm_view_types:
+        if widget_type == ida_kernwin.BWN_DISASM:
             # logger.debug("_render_lines: Highlighting disassembly.")
             self._highlight_disassembly(lines_out, lines_in, address_to_color)
         elif ida_hexrays and widget_type == ida_kernwin.BWN_PSEUDOCODE:
@@ -1060,37 +1096,13 @@ class IDACtxEntry(ida_kernwin.action_handler_t):
 #------------------------------------------------------------------------------
 
 class DbgHooks(ida_dbg.DBG_Hooks):
-    def __init__(self):
-        super(DbgHooks, self).__init__()
-        self._bpt_changed_cb = None
-
     def dbg_bpt_changed(self, code, bpt):
-        if self._bpt_changed_cb:
-            return self._bpt_changed_cb(code, bpt)
-        return 0
+        pass
 
 class UIHooks(ida_kernwin.UI_Hooks):
-    def __init__(self):
-        super(UIHooks, self).__init__()
-        self._render_lines_cb = None
-        self._popup_cb = None
-        self._ready_to_run_cb = None
-
     def get_lines_rendering_info(self, lines_out, widget, lines_in):
-        if self._render_lines_cb:
-            try:
-                self._render_lines_cb(lines_out, widget, lines_in)
-            except Exception:
-                logger.exception("Error in get_lines_rendering_info callback")
+        pass
     def ready_to_run(self):
-        if self._ready_to_run_cb:
-            try:
-                self._ready_to_run_cb()
-            except Exception:
-                logger.exception("Error in ready_to_run callback")
+        pass
     def finish_populating_widget_popup(self, widget, popup):
-        if self._popup_cb:
-            try:
-                self._popup_cb(widget, popup)
-            except Exception:
-                logger.exception("Error in finish_populating_widget_popup callback")
+        pass
