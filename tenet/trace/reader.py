@@ -131,9 +131,20 @@ class TraceReader(object):
             return self._dump_overlay_cache[dump_dir]
 
         if not os.path.isdir(dump_dir):
-            pmsg(f"[Tenet] dump dir does not exist: {dump_dir}")
-            self._dump_overlay_cache[dump_dir] = []
-            return []
+            #
+            # if the absolute dump_dir does not exist, try to find a folder
+            # with the same basename in the trace file's own directory
+            #
+            dump_basename = os.path.basename(dump_dir)
+            trace_dir = os.path.dirname(self.trace.filepath)
+            local_dump_dir = os.path.join(trace_dir, dump_basename)
+            if os.path.isdir(local_dump_dir):
+                pmsg(f"[Tenet] dump dir not found at absolute path, using local: {local_dump_dir}")
+                dump_dir = local_dump_dir
+            else:
+                pmsg(f"[Tenet] dump dir does not exist: {dump_dir}")
+                self._dump_overlay_cache[dump_dir] = []
+                return []
 
         overlay = []
         pattern = re.compile(r"0x([0-9a-fA-F]+)_0x([0-9a-fA-F]+)_0x([0-9a-fA-F]+)\.bin$")

@@ -1,4 +1,5 @@
 import os
+import json
 import logging
 import traceback
 
@@ -132,9 +133,85 @@ class TenetContext(object):
         """
         self.close_trace()
     
-    #-------------------------------------------------------------------------
-    # Public API
-    #-------------------------------------------------------------------------
+    def _find_latest_dump_and_rebase(self, trace_filepath):
+        """
+        Look for matching dump folders in the trace file's directory.
+        If the latest dump folder contains reg.json with a 'base' field,
+        automatically rebase IDA to that base address.
+
+        Returns True if rebase was performed, False otherwise.
+        """
+        import ida_segment
+
+        trace_dir = os.path.dirname(trace_filepath)
+        if not trace_dir:
+            trace_dir = "."
+
+        # Find all dump directories matching the pattern (dump_*) that contain reg.json/regs.json
+        dump_dirs = []
+        try:
+            for name in os.listdir(trace_dir):
+                full_path = os.path.join(trace_dir, name)
+                if not os.path.isdir(full_path):
+                    continue
+                if not name.startswith("dump_"):
+                    continue
+                # check for reg.json or regs.json
+                reg_json = None
+                for candidate in ("reg.json", "regs.json"):
+                    candidate_path = os.path.join(full_path, candidate)
+                    if os.path.isfile(candidate_path):
+                        reg_json = candidate_path
+                        break
+                if reg_json:
+                    mtime = os.path.getmtime(reg_json)
+                    dump_dirs.append((mtime, full_path, reg_json))
+        except OSError as e:
+            logger.debug(f"Could not list dump directories in {trace_dir}: {e}")
+            return False
+
+        if not dump_dirs:
+            logger.debug(f"No dump folders with reg.json found in {trace_dir}")
+            return False
+
+        # Sort by modification time (newest first), pick the latest
+        dump_dirs.sort(key=lambda x: x[0], reverse=True)
+        mtime, latest_dump_dir, reg_json_path = dump_dirs[0]
+
+        # Parse reg.json
+        try:
+            with open(reg_json_path, 'r') as f:
+                reg_data = json.load(f)
+        except (json.JSONDecodeError, IOError) as e:
+            pmsg(f"[Tenet] Failed to read reg.json from {latest_dump_dir}: {e}")
+            return False
+
+        if "base" not in reg_data:
+            pmsg(f"[Tenet] reg.json in {latest_dump_dir} has no 'base' field, skipping auto-rebase")
+            return False
+
+        base = reg_data["base"]
+        # Convert to int if it's a hex string
+        if isinstance(base, str):
+            try:
+                base = int(base, 16) if base.startswith("0x") or base.startswith("0X") else int(base)
+            except (ValueError, TypeError):
+                pmsg(f"[Tenet] Invalid base value in reg.json: {base}")
+                return False
+        elif not isinstance(base, int):
+            pmsg(f"[Tenet] Invalid base value type in reg.json: {type(base)}")
+            return False
+
+        # Perform IDA rebase
+        try:
+            # MSF_NOFIX = 0: do not fix up relocations
+            ida_segment.rebase_program(base, 0)
+            pmsg(f"[Tenet] Auto-rebased IDA to 0x{base:X} (from reg.json in {os.path.basename(latest_dump_dir)})")
+            return True
+        except Exception as e:
+            pmsg(f"[Tenet] Failed to rebase IDA to 0x{base:X}: {e}")
+            logger.exception("IDA rebase failed:")
+            return False
 
     def trace_loaded(self):
         """
@@ -282,6 +359,12 @@ class TenetContext(object):
         assert len(filenames) == 1, "Please select only one trace file to load"
         disassembler.show_wait_box("Loading trace from disk...")
         filepath = filenames[0]
+
+        #
+        # auto-detect matching dump folders and rebase IDA if reg.json
+        # in the latest dump folder contains a 'base' field
+        #
+        self._find_latest_dump_and_rebase(filepath)
 
         # attempt to load the user selected trace
         try:
