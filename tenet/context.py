@@ -2,6 +2,7 @@ import os
 import json
 import logging
 import traceback
+import re
 
 from tenet.util.qt import *
 from tenet.util.log import pmsg
@@ -133,61 +134,64 @@ class TenetContext(object):
         """
         self.close_trace()
     
-    def _find_latest_dump_and_rebase(self, trace_filepath):
+    def _find_earliest_dump_and_rebase(self, trace_filepath):
         """
         Look for matching dump folders in the trace file's directory.
-        If the latest dump folder contains reg.json with a 'base' field,
+        If the earliest dump folder contains regs.json/reg.json with a 'base' field,
         automatically rebase IDA to that base address.
 
         Returns True if rebase was performed, False otherwise.
         """
+        import ida_nalt
         import ida_segment
 
         trace_dir = os.path.dirname(trace_filepath)
         if not trace_dir:
             trace_dir = "."
 
-        # Find all dump directories matching the pattern (dump_*) that contain reg.json/regs.json
+        # Find all dump directories matching dump_<timestamp>; use the earliest timestamp.
+        # File mtimes are easy to skew by copies/edits, so directory names are the source of truth.
         dump_dirs = []
         try:
             for name in os.listdir(trace_dir):
                 full_path = os.path.join(trace_dir, name)
                 if not os.path.isdir(full_path):
                     continue
-                if not name.startswith("dump_"):
+                dump_match = re.match(r"^dump_(\d+)$", name)
+                if not dump_match:
                     continue
-                # check for reg.json or regs.json
+                dump_timestamp = int(dump_match.group(1))
+                # Prefer regs.json because that is what dump generation writes now.
                 reg_json = None
-                for candidate in ("reg.json", "regs.json"):
+                for candidate in ("regs.json", "reg.json"):
                     candidate_path = os.path.join(full_path, candidate)
                     if os.path.isfile(candidate_path):
                         reg_json = candidate_path
                         break
                 if reg_json:
-                    mtime = os.path.getmtime(reg_json)
-                    dump_dirs.append((mtime, full_path, reg_json))
+                    dump_dirs.append((dump_timestamp, full_path, reg_json))
         except OSError as e:
             logger.debug(f"Could not list dump directories in {trace_dir}: {e}")
             return False
 
         if not dump_dirs:
-            logger.debug(f"No dump folders with reg.json found in {trace_dir}")
+            logger.debug(f"No dump folders with regs.json/reg.json found in {trace_dir}")
             return False
 
-        # Sort by modification time (newest first), pick the latest
-        dump_dirs.sort(key=lambda x: x[0], reverse=True)
-        mtime, latest_dump_dir, reg_json_path = dump_dirs[0]
+        # Sort by dump_<timestamp> ascending; earliest dump provides the initial base.
+        dump_dirs.sort(key=lambda x: x[0])
+        _, earliest_dump_dir, reg_json_path = dump_dirs[0]
 
-        # Parse reg.json
+        # Parse regs.json/reg.json
         try:
             with open(reg_json_path, 'r') as f:
                 reg_data = json.load(f)
         except (json.JSONDecodeError, IOError) as e:
-            pmsg(f"[Tenet] Failed to read reg.json from {latest_dump_dir}: {e}")
+            pmsg(f"[Tenet] Failed to read {os.path.basename(reg_json_path)} from {earliest_dump_dir}: {e}")
             return False
 
         if "base" not in reg_data:
-            pmsg(f"[Tenet] reg.json in {latest_dump_dir} has no 'base' field, skipping auto-rebase")
+            pmsg(f"[Tenet] {os.path.basename(reg_json_path)} in {earliest_dump_dir} has no 'base' field, skipping auto-rebase")
             return False
 
         base = reg_data["base"]
@@ -202,11 +206,18 @@ class TenetContext(object):
             pmsg(f"[Tenet] Invalid base value type in reg.json: {type(base)}")
             return False
 
-        # Perform IDA rebase
+        # Perform IDA rebase. IDA's rebase_program() takes a delta, not the
+        # target imagebase, so compute the difference explicitly.
         try:
+            current_base = ida_nalt.get_imagebase()
+            if current_base == base:
+                pmsg(f"[Tenet] IDA already rebased to 0x{base:X} (from {os.path.basename(reg_json_path)} in {os.path.basename(earliest_dump_dir)})")
+                return True
+
+            delta = base - current_base
             # MSF_NOFIX = 0: do not fix up relocations
-            ida_segment.rebase_program(base, 0)
-            pmsg(f"[Tenet] Auto-rebased IDA to 0x{base:X} (from reg.json in {os.path.basename(latest_dump_dir)})")
+            ida_segment.rebase_program(delta, 0)
+            pmsg(f"[Tenet] Auto-rebased IDA from 0x{current_base:X} to 0x{base:X} (delta 0x{delta:X}, from {os.path.basename(reg_json_path)} in {os.path.basename(earliest_dump_dir)})")
             return True
         except Exception as e:
             pmsg(f"[Tenet] Failed to rebase IDA to 0x{base:X}: {e}")
@@ -361,10 +372,10 @@ class TenetContext(object):
         filepath = filenames[0]
 
         #
-        # auto-detect matching dump folders and rebase IDA if reg.json
-        # in the latest dump folder contains a 'base' field
+        # auto-detect matching dump folders and rebase IDA if regs.json/reg.json
+        # in the earliest dump folder contains a 'base' field
         #
-        self._find_latest_dump_and_rebase(filepath)
+        self._find_earliest_dump_and_rebase(filepath)
 
         # attempt to load the user selected trace
         try:

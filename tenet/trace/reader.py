@@ -63,20 +63,9 @@ class TraceReader(object):
 
         # load the given trace file from disk
         self.trace = TraceFile(filepath, architecture)
-        # Check if base address was parsed from comment and calculate slide
-        manual_slide = None
-        # Check existence of attribute first to avoid errors if TraceFile init failed partially
-        if hasattr(self.trace, 'runtime_base_from_comment') and self.trace.runtime_base_from_comment is not None and dctx:
-            try:
-                ida_base = dctx.get_imagebase()
-                manual_slide = self.trace.runtime_base_from_comment - ida_base
-                pmsg(f"Calculated manual slide: 0x{manual_slide:X} (Runtime: 0x{self.trace.runtime_base_from_comment:X}, IDA: 0x{ida_base:X})")
-            except Exception as e:
-                pmsg(f"Error calculating manual slide: {e}")
-                manual_slide = None # Ensure manual_slide is None if calculation fails
-
-        # Pass the manual slide to TraceAnalysis, it will use it if not None
-        self.analysis = TraceAnalysis(self.trace, dctx, manual_slide=manual_slide)
+        # IDA is rebased before trace load from the earliest dump regs.json/reg.json.
+        # Do not derive another slide from trace metadata (# SO / .tt runtime_base).
+        self.analysis = TraceAnalysis(self.trace, dctx, manual_slide=None)
 
         # Optional dump overlay memory (for Memory/Stack/Dump views only).
         # This never writes to IDB/binary; data is consumed only by get_memory().
